@@ -1,0 +1,324 @@
+#!/bin/sh
+# ztOS herolight Initramfs
+# First-stage init - runs directly from kernel boot
+# Responsibilities:
+#   1. Mount essential virtual filesystems
+#   2. Detect partitions and hardware
+#   3. Set up USB gadget networking (RNDIS + ACM serial)
+#   4. Mount or create ztOS rootfs on USERDATA
+#   5. Assemble read-only SYSTEM+VENDOR overlay for Samsung daemons
+#   6. switch_root to real init
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export LD_LIBRARY_PATH=/lib:/lib64
+
+# Colors for console output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info()  { echo -e "${GREEN}[ztOS]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[ztOS]${NC} $1"; }
+log_error() { echo -e "${RED}[ztOS]${NC} $1"; }
+log_step()  { echo -e "${BLUE}[ztOS]${NC} $1"; }
+
+# Early panic handler - drops to emergency shell
+die() {
+    log_error "$1"
+    log_error "Dropping to emergency shell. Type 'exit' to retry boot."
+    exec /bin/sh
+}
+
+# Mount essential filesystems
+log_step "Mounting virtual filesystems..."
+mount -t proc none /proc || die "Failed to mount /proc"
+mount -t sysfs none /sys  || die "Failed to mount /sys"
+mount -t devtmpfs none /dev || die "Failed to mount /dev"
+mount -t tmpfs none /run  || die "Failed to mount /run"
+mount -t tmpfs none /tmp  || die "Failed to mount /tmp"
+
+# Create essential device nodes (in case devtmpfs misses some)
+mkdir -p /dev/pts
+mount -t devpts none /dev/pts
+
+# Parse kernel cmdline for debug options
+DEBUG_SHELL=""
+ZTOS_ROOT=""
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        ztos.debug=1) DEBUG_SHELL=1 ;;
+        ztos.root=*) ZTOS_ROOT="${arg#ztos.root=}" ;;
+    esac
+done
+
+# Detect SoC and device variant
+log_step "Detecting hardware..."
+SOC="unknown"
+if [ -r /proc/device-tree/compatible ]; then
+    SOC=$(tr '\0' ' ' < /proc/device-tree/compatible | head -1)
+fi
+log_info "SoC: $SOC"
+
+# Check for Exynos 8890 specific nodes
+if [ -d /sys/bus/platform/devices/10000000.mct ]; then
+    log_info "Exynos MCT timer detected"
+fi
+if [ -d /sys/bus/platform/devices/13800000.decon ]; then
+    log_info "DECON display controller detected"
+fi
+
+# Find block devices by name
+find_partition() {
+    local name="$1"
+    local path="/dev/block/bootdevice/by-name/$name"
+    if [ -e "$path" ]; then
+        echo "$path"
+        return 0
+    fi
+    # Fallback: search by PARTNAME
+    for dev in /sys/block/mmcblk* /sys/block/sd*; do
+        [ -d "$dev" ] || continue
+        for part in "$dev"/*; do
+            [ -d "$part" ] || continue
+            if [ -r "$part/uevent" ]; then
+                if grep -q "PARTNAME=$name" "$part/uevent" 2>/dev/null; then
+                    echo "/dev/$(basename $part)"
+                    return 0
+                fi
+            fi
+        done
+    done
+    return 1
+}
+
+log_step "Locating partitions..."
+BOOT_PART=$(find_partition "BOOT" || true)
+RECOVERY_PART=$(find_partition "RECOVERY" || true)
+SYSTEM_PART=$(find_partition "SYSTEM" || true)
+VENDOR_PART=$(find_partition "VENDOR" || true)
+USERDATA_PART=$(find_partition "USERDATA" || true)
+EFS_PART=$(find_partition "EFS" || true)
+CPEFS_PART=$(find_partition "CPEFS" || true)
+RADIO_PART=$(find_partition "RADIO" || true)
+
+log_info "BOOT:     ${BOOT_PART:-NOT FOUND}"
+log_info "RECOVERY: ${RECOVERY_PART:-NOT FOUND}"
+log_info "SYSTEM:   ${SYSTEM_PART:-NOT FOUND}"
+log_info "VENDOR:   ${VENDOR_PART:-NOT FOUND}"
+log_info "USERDATA: ${USERDATA_PART:-NOT FOUND}"
+log_info "EFS:      ${EFS_PART:-NOT FOUND}"
+
+# Safety check: EFS must exist
+if [ -z "$EFS_PART" ]; then
+    die "EFS partition not found! This is critical - aborting."
+fi
+
+# Set up USB gadget for installer/debug access
+# This creates RNDIS (USB ethernet) + ACM (serial console) composite device
+setup_usb_gadget() {
+    log_step "Setting up USB gadget..."
+    
+    local GADGET_DIR="/sys/kernel/config/usb_gadget/ztos"
+    local UDC=$(ls /sys/class/udc/ 2>/dev/null | head -1)
+    
+    if [ -z "$UDC" ]; then
+        log_warn "No UDC found - USB gadget not available"
+        return 1
+    fi
+    
+    mkdir -p /sys/kernel/config/usb_gadget 2>/dev/null || {
+        log_warn "ConfigFS not available for USB gadget"
+        return 1
+    }
+    
+    mkdir -p "$GADGET_DIR"
+    echo "0x18D1" > "$GADGET_DIR/idVendor"   # Google (generic)
+    echo "0x4EE7" > "$GADGET_DIR/idProduct"  # Nexus/Pixel accessory
+    echo "0x0200" > "$GADGET_DIR/bcdUSB"     # USB 2.0
+    echo "0x0100" > "$GADGET_DIR/bcdDevice"
+    
+    mkdir -p "$GADGET_DIR/strings/0x409"
+    echo "Zerone-Labs" > "$GADGET_DIR/strings/0x409/manufacturer"
+    echo "ztOS herolight" > "$GADGET_DIR/strings/0x409/product"
+    echo "$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo 'deadbeef')" > "$GADGET_DIR/strings/0x409/serialnumber"
+    
+    # Configuration
+    mkdir -p "$GADGET_DIR/configs/c.1"
+    mkdir -p "$GADGET_DIR/configs/c.1/strings/0x409"
+    echo "RNDIS + ACM" > "$GADGET_DIR/configs/c.1/strings/0x409/configuration"
+    
+    # RNDIS function (USB ethernet)
+    mkdir -p "$GADGET_DIR/functions/rndis.usb0"
+    echo "RNDIS" > "$GADGET_DIR/functions/rndis.usb0/os_desc/interface.rndis/compatible_id"
+    echo "5162001" > "$GADGET_DIR/functions/rndis.usb0/os_desc/interface.rndis/sub_compatible_id"
+    ln -s "$GADGET_DIR/functions/rndis.usb0" "$GADGET_DIR/configs/c.1/" 2>/dev/null || true
+    
+    # ACM function (serial console)
+    mkdir -p "$GADGET_DIR/functions/acm.usb0"
+    ln -s "$GADGET_DIR/functions/acm.usb0" "$GADGET_DIR/configs/c.1/" 2>/dev/null || true
+    
+    # Mass storage (expose EFS for backup verification - read-only)
+    mkdir -p "$GADGET_DIR/functions/mass_storage.usb0"
+    echo 0 > "$GADGET_DIR/functions/mass_storage.usb0/lun.0/removable"
+    echo 1 > "$GADGET_DIR/functions/mass_storage.usb0/lun.0/ro"
+    echo "$EFS_PART" > "$GADGET_DIR/functions/mass_storage.usb0/lun.0/file"
+    ln -s "$GADGET_DIR/functions/mass_storage.usb0" "$GADGET_DIR/configs/c.1/" 2>/dev/null || true
+    
+    # Bind to UDC
+    echo "$UDC" > "$GADGET_DIR/UDC"
+    
+    # Configure network interface
+    if [ -d /sys/class/net/usb0 ]; then
+        ip link set usb0 up
+        ip addr add 172.16.42.1/24 dev usb0
+        log_info "USB RNDIS configured at 172.16.42.1"
+    fi
+    
+    log_info "USB gadget active on $UDC"
+    return 0
+}
+
+# Mount or create ztOS rootfs
+setup_rootfs() {
+    log_step "Setting up root filesystem..."
+    
+    if [ -z "$USERDATA_PART" ]; then
+        die "USERDATA partition not found - cannot mount rootfs"
+    fi
+    
+    # Check if USERDATA already has ztOS (ext4 with .ztos marker)
+    local FS_TYPE=$(blkid -s TYPE -o value "$USERDATA_PART" 2>/dev/null || true)
+    
+    if [ "$FS_TYPE" = "ext4" ]; then
+        # Try to mount and check for ztOS marker
+        mkdir -p /mnt/userdata
+        if mount -t ext4 -o rw "$USERDATA_PART" /mnt/userdata 2>/dev/null; then
+            if [ -f /mnt/userdata/.ztos-root ]; then
+                log_info "Existing ztOS rootfs found"
+                umount /mnt/userdata
+                return 0
+            fi
+            umount /mnt/userdata
+        fi
+    fi
+    
+    # No ztOS rootfs found - need to create or this is first boot
+    log_warn "No ztOS rootfs found on USERDATA"
+    log_warn "First boot requires rootfs to be flashed via installer"
+    
+    # Create minimal rootfs structure for emergency mode
+    mkdir -p /mnt/userdata
+    if mount -t ext4 -o rw "$USERDATA_PART" /mnt/userdata 2>/dev/null; then
+        if [ ! -f /mnt/userdata/.ztos-root ]; then
+            log_step "Creating minimal rootfs structure..."
+            mkdir -p /mnt/userdata/{bin,sbin,lib,lib64,etc,var,run,tmp,root,home,usr,proc,sys,dev,ztos}
+            touch /mnt/userdata/.ztos-root
+            echo "herolight" > /mnt/userdata/etc/hostname
+            log_info "Minimal rootfs created"
+        fi
+        umount /mnt/userdata
+    fi
+    
+    return 0
+}
+
+# Mount Samsung stock partitions for daemon access
+setup_stock_overlay() {
+    log_step "Setting up stock partition overlay..."
+    
+    mkdir -p /mnt/stock/system /mnt/stock/vendor
+    
+    if [ -n "$SYSTEM_PART" ]; then
+        if mount -t ext4 -o ro "$SYSTEM_PART" /mnt/stock/system 2>/dev/null; then
+            log_info "SYSTEM mounted read-only"
+        else
+            log_warn "Could not mount SYSTEM"
+        fi
+    fi
+    
+    if [ -n "$VENDOR_PART" ]; then
+        if mount -t ext4 -o ro "$VENDOR_PART" /mnt/stock/vendor 2>/dev/null; then
+            log_info "VENDOR mounted read-only"
+        else
+            log_warn "Could not mount VENDOR"
+        fi
+    fi
+    
+    # Create bind mounts for Samsung binaries
+    # cbd (modem daemon) and lhd (sensor hub daemon) need these paths
+    mkdir -p /mnt/rootfs/samsung/bin /mnt/rootfs/samsung/lib
+    
+    if [ -d /mnt/stock/system/bin ]; then
+        cp -a /mnt/stock/system/bin/cbd /mnt/rootfs/samsung/bin/ 2>/dev/null || true
+        cp -a /mnt/stock/system/bin/lhd /mnt/rootfs/samsung/bin/ 2>/dev/null || true
+    fi
+    
+    if [ -d /mnt/stock/vendor/lib ]; then
+        cp -a /mnt/stock/vendor/lib/*.so /mnt/rootfs/samsung/lib/ 2>/dev/null || true
+    fi
+}
+
+# Main boot sequence
+main() {
+    echo ""
+    log_step "ztOS herolight Initramfs"
+    log_info "Version: pre-alpha"
+    echo ""
+    
+    # Set up USB gadget early for installer/debug access
+    setup_usb_gadget
+    
+    # Set up rootfs
+    setup_rootfs
+    
+    # Set up stock overlay
+    setup_stock_overlay
+    
+    # Debug shell if requested
+    if [ -n "$DEBUG_SHELL" ]; then
+        log_warn "Debug shell requested via cmdline"
+        log_info "Available commands: lsblk, blkid, dmesg, find_partition <name>"
+        /bin/sh
+    fi
+    
+    # Mount the real rootfs
+    log_step "Mounting root filesystem..."
+    mkdir -p /mnt/rootfs
+    
+    if ! mount -t ext4 -o rw "$USERDATA_PART" /mnt/rootfs 2>/dev/null; then
+        die "Failed to mount rootfs from $USERDATA_PART"
+    fi
+    
+    if [ ! -f /mnt/rootfs/.ztos-root ]; then
+        log_warn "Rootfs mounted but missing .ztos-root marker"
+    fi
+    
+    # Move mount points to new root
+    mkdir -p /mnt/rootfs/proc /mnt/rootfs/sys /mnt/rootfs/dev /mnt/rootfs/run /mnt/rootfs/tmp
+    
+    mount --move /proc /mnt/rootfs/proc
+    mount --move /sys /mnt/rootfs/sys
+    mount --move /dev /mnt/rootfs/dev
+    mount --move /run /mnt/rootfs/run
+    mount --move /tmp /mnt/rootfs/tmp
+    
+    # Preserve gadget config if active
+    if [ -d /sys/kernel/config/usb_gadget/ztos ]; then
+        mkdir -p /mnt/rootfs/sys/kernel/config/usb_gadget
+        mount --bind /sys/kernel/config/usb_gadget /mnt/rootfs/sys/kernel/config/usb_gadget
+    fi
+    
+    log_step "Switching to real root..."
+    echo ""
+    
+    # Clean up and switch
+    exec switch_root /mnt/rootfs /sbin/init 2>/dev/null || \
+    exec switch_root /mnt/rootfs /bin/init 2>/dev/null || \
+    exec switch_root /mnt/rootfs /init 2>/dev/null || \
+    die "switch_root failed - no init found in rootfs"
+}
+
+# Run main
+main

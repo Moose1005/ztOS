@@ -1,0 +1,346 @@
+/*
+ * Samsung Galaxy S7 (SM-G930W8) - herolight
+ * Device Tree Source for mainline Linux
+ *
+ * Based on Samsung's GPL kernel source for universal8890
+ * and upstream Exynos 8890 support.
+ *
+ * This device tree is a WORK IN PROGRESS for ztOS porting.
+ * Many nodes are disabled pending driver bring-up.
+ */
+
+/dts-v1/;
+
+#include "exynos8890.dtsi"
+
+/ {
+	model = "Samsung Galaxy S7 (SM-G930W8)";
+	compatible = "samsung,herolight", "samsung,exynos8890", "samsung,exynos8";
+
+	aliases {
+		serial0 = &serial_0;
+		console = &serial_0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		#address-cells = <2>;
+		#size-cells = <2>;
+	};
+
+	/* 4GB RAM configuration for herolight */
+	memory@80000000 {
+		device_type = "memory";
+		/* First 3GB at 0x80000000 */
+		reg = <0x0 0x80000000 0x0 0xC0000000>;
+	};
+
+	/* No second memory bank - herolight has 4GB, not 6GB like hero2lte */
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* Modem/sharing region */
+		modem_if@8f700000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0x8f700000 0x0 0x01000000>;
+			no-map;
+		};
+
+		/* Samsung TZ reserved */
+		tzfw@90000000 {
+			reg = <0x0 0x90000000 0x0 0x01000000>;
+			no-map;
+		};
+	};
+};
+
+/* UART 0 - Debug console (no physical UART on phone, uses ramoops) */
+&serial_0 {
+	status = "okay";
+};
+
+/* UFS - Internal storage */
+&ufs {
+	status = "okay";
+	/* UFS reset gpio - to be determined */
+};
+
+/* SDHCI - SD card / external storage */
+&sdhci_2 {
+	status = "okay";
+	bus-width = <4>;
+	cap-sd-highspeed;
+	/* SD card detect GPIO */
+};
+
+/* DECON - Display controller */
+&decon {
+	status = "okay";
+
+	/* 5.1" 1440x2560 Super AMOLED panel */
+	samsung,fb-bpp = <32>;
+	samsung,fb-vres = <2560>;
+	samsung,fb-hres = <1440>;
+
+	panel@0 {
+		compatible = "samsung,s6e3fa3";
+		reg = <0>;
+		/* DSI channel 0 */
+	};
+};
+
+/* DSI - Display Serial Interface */
+&dsi {
+	status = "okay";
+
+	ports = <&dsim_port>;
+};
+
+/* Touchscreen - S6SY761 */
+&i2c_3 {
+	status = "okay";
+
+	touchscreen@48 {
+		compatible = "samsung,s6sy761";
+		reg = <0x48>;
+		interrupt-parent = <&gpa2>;
+		interrupts = <3 IRQ_TYPE_EDGE_FALLING>;
+		touchscreen-size-x = <1440>;
+		touchscreen-size-y = <2560>;
+	};
+};
+
+/* PMIC - MAX77705 + MAX77854 */
+&i2c_5 {
+	status = "okay";
+
+	max77705@66 {
+		compatible = "maxim,max77705";
+		reg = <0x66>;
+		interrupt-parent = <&gpa2>;
+		interrupts = <7 IRQ_TYPE_EDGE_FALLING>;
+
+		/* Charger */
+		charger {
+			compatible = "maxim,max77705-charger";
+			/* 3000mAh battery, 4.35V float, 1.5A charge current */
+			battery-full-design-capacity-microamp-hours = <3000000>;
+			constant-charge-voltage-max-microvolt = <4350000>;
+			constant-charge-current-max-microamp = <1500000>;
+		};
+
+		/* Fuel gauge */
+		fuel-gauge {
+			compatible = "maxim,max77705-fg";
+		};
+
+		/* MUIC - Micro USB Interface Controller */
+		muic {
+			compatible = "maxim,max77705-muic";
+		};
+
+		/* Haptic/vibrator */
+		haptic {
+			compatible = "maxim,max77705-haptic";
+		};
+	};
+
+	max77854@30 {
+		compatible = "maxim,max77854";
+		reg = <0x30>;
+		/* Secondary PMIC for additional rails */
+	};
+};
+
+/* Battery gauge - MAX17042 (secondary) */
+&i2c_7 {
+	status = "okay";
+
+	fuel-gauge@36 {
+		compatible = "maxim,max17042";
+		reg = <0x36>;
+		/* Used for accurate battery monitoring */
+	};
+};
+
+/* USB - Exynos DWC3 */
+&usbdrd_dwc3 {
+	status = "okay";
+	dr_mode = "peripheral"; /* Phone mode */
+};
+
+&usbdrd_phy {
+	status = "okay";
+};
+
+/* PCIe - For Wi-Fi BCM4361 */
+&pcie {
+	status = "okay";
+
+	/* Wi-Fi card on PCIe */
+	wifi@0,0 {
+		compatible = "brcm,bcm4361-pcie";
+		reg = <0x0000 0 0 0 0>;
+		/* Firmware loaded from vendor partition */
+	};
+};
+
+/* I2S - Audio interface */
+&i2s_0 {
+	status = "okay";
+
+	/* ABOX (Audio Box) - Samsung audio DSP */
+	samsung,abox {
+		compatible = "samsung,abox";
+		/* Audio DSP firmware loaded from vendor partition */
+	};
+};
+
+/* SPI - For fingerprint sensor (disabled until driver ready) */
+&spi_0 {
+	status = "disabled";
+};
+
+/* BLUETOOTH - UART connected (not started) */
+&serial_1 {
+	status = "disabled";
+	/* Bluetooth HCI over UART */
+};
+
+/* NFC - NQ331 (disabled until driver ready) */
+&i2c_6 {
+	status = "disabled";
+};
+
+/* Sensor hub - Samsung SSP (disabled until driver ready) */
+&i2c_4 {
+	status = "disabled";
+};
+
+/* Camera - disabled until ISP driver ready */
+&csis_0 {
+	status = "disabled";
+};
+
+&csis_1 {
+	status = "disabled";
+};
+
+&flite_0 {
+	status = "disabled";
+};
+
+&flite_1 {
+	status = "disabled";
+};
+
+/* GPU - Mali-T880 MP12 (enabled, Panfrost compatible) */
+&gpu {
+	status = "okay";
+	/* Mali-T880 is Midgard, supported by Panfrost in Mesa */
+};
+
+/* CPU idle states - disabled until big core resume fixed */
+&cpu0 {
+	cpu-idle-states = <&idle_states>;
+};
+
+&cpu1 {
+	cpu-idle-states = <&idle_states>;
+};
+
+&cpu2 {
+	cpu-idle-states = <&idle_states>;
+};
+
+&cpu3 {
+	cpu-idle-states = <&idle_states>;
+};
+
+/* Big cores (Mongoose M1) - no deep idle until resume fixed */
+&cpu4 {
+	/* Idle states disabled - see ztOS known issue #5 */
+};
+
+&cpu5 {
+	/* Idle states disabled */
+};
+
+&cpu6 {
+	/* Idle states disabled */
+};
+
+&cpu7 {
+	/* Idle states disabled */
+};
+
+/* Thermal zones - basic configuration */
+&thermal_zones {
+	cpu_thermal: cpu-thermal {
+		polling-delay-passive = <250>;
+		polling-delay = <1000>;
+		thermal-sensors = <&tmu_cpu>;
+
+		trips {
+			cpu_alert0: cpu-alert-0 {
+				temperature = <85000>;
+				hysteresis = <10000>;
+				type = "passive";
+			};
+			cpu_crit: cpu-crit {
+				temperature = <105000>;
+				hysteresis = <10000>;
+				type = "critical";
+			};
+		};
+
+		cooling-maps {
+			map0 {
+				trip = <&cpu_alert0>;
+				cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+};
+
+/* Watchdog - enabled for failsafe */
+&watchdog {
+	status = "okay";
+	/* 30-second watchdog for boot failsafe */
+};
+
+/* RTC - Real time clock */
+&rtc {
+	status = "okay";
+};
+
+/* PWM - for notification LED */
+&pwm {
+	status = "okay";
+};
+
+/* LED notification */
+&leds {
+	status = "okay";
+
+	led_red {
+		label = "red";
+		/* PWM controlled */
+	};
+
+	led_green {
+		label = "green";
+	};
+
+	led_blue {
+		label = "blue";
+	};
+};
+
+/* TMU - Thermal Management Unit */
+&tmu {
+	status = "okay";
+};
